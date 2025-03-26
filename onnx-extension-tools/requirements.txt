@@ -1,0 +1,5 @@
+onnx>=1.16.0
+onnxruntime>=1.16.0
+onnxruntime-gpu
+onnxruntime_extensions
+ultralytics
