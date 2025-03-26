@@ -2,16 +2,20 @@ import os
 import sys
 import argparse
 import warnings
+
 import torch
 import torch.nn as nn
 import onnx
 
 # Add the parent directory to the Python path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-from src.core import YAMLConfig
+from src.core import YAMLConfig  # Make sure this import works correctly
 
 
 class PostProcessor(nn.Module):
+    """
+    Post-processes the model output to get the final detections.
+    """
     def __init__(self, img_size):
         super().__init__()
         self.img_size = img_size
@@ -35,7 +39,11 @@ def suppress_warnings():
 def load_model(weights, cfg_file):
     """Load the PyTorch model."""
     cfg = YAMLConfig(cfg_file, resume=weights)
-    checkpoint = torch.load(weights, map_location='cpu', weights_only=True)
+    torch_version = torch.__version__.split('+')[0]
+    if torch_version <= "2.0.1":
+        checkpoint = torch.load(weights, map_location='cpu')
+    else:
+        checkpoint = torch.load(weights, map_location='cpu', weights_only=True)
 
     # Check if 'ema' exists in checkpoint and load state accordingly
     if 'ema' in checkpoint:
@@ -49,8 +57,6 @@ def load_model(weights, cfg_file):
 def export_onnx_model(model, img_size, batch_size, onnx_output_file, opset_version, dynamic_axes, simplify):
     """Export the PyTorch model to ONNX format."""
     device = torch.device('cpu')
-
-    # Move the model to CPU
     model = model.to(device)
 
     # Determine if the batch size is dynamic or fixed
@@ -155,6 +161,10 @@ def main(args):
     model = load_model(args.weights, args.config)
     img_size = args.size * 2 if len(args.size) == 1 else args.size
     model = nn.Sequential(model, PostProcessor(img_size))
+
+    if args.dynamic:
+        model = ensure_dynamic_support(model)  # Call the function for dynamic batch size
+
     export_onnx_model(model, img_size, args.batch, args.output, args.opset, args.dynamic, args.simplify)
 
 

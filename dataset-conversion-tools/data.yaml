@@ -1,0 +1,9 @@
+path: .  # Use '.' to indicate the current directory as the root
+train: trak_dataset/train/images/
+train_labels: trak_dataset/train/labels/  # Add this
+val: trak_dataset/valid/images/
+val_labels: trak_dataset/valid/labels/  # Add this
+
+nc: 1
+names: ['person']
+
