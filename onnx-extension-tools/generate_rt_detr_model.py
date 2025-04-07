@@ -6,6 +6,8 @@ import warnings
 import torch
 import torch.nn as nn
 import onnx
+import onnxruntime_extensions.tools.pre_post_processing as pre_post
+from onnx import TensorProto  # Import TensorProto for data types
 
 # Add the parent directory to the Python path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -17,6 +19,7 @@ class PostProcessor(nn.Module):
     """
     Post-processes the model output to get the final detections.
     """
+
     def __init__(self, img_size):
         super().__init__()
         self.img_size = img_size
@@ -136,6 +139,7 @@ def ensure_dynamic_support(model):
 
     This step adjusts operations that may assume static shapes, like reshaping.
     """
+
     class DynamicWrapper(nn.Module):
         def __init__(self, model):
             super().__init__()
@@ -168,6 +172,86 @@ def main(args):
 
     export_onnx_model(model, img_size, args.batch, args.output, args.opset, args.dynamic, args.simplify)
 
+    # Load the exported ONNX model
+    onnx_model = onnx.load(args.output)
+
+    # Define pre-processing pipeline
+    inputs = [pre_post.create_named_value("image_bytes", onnx.TensorProto.UINT8, ["batch", "num_bytes"])]
+    pipeline = pre_post.PrePostProcessor(inputs, args.opset)
+
+    pre_processing_steps = [
+        pre_post.ConvertImageToBGR(name="BGRImageHWC"),
+        pre_post.ChannelsLastToChannelsFirst(name="BGRImageCHW"),
+        pre_post.Resize((img_size[0], img_size[1]), policy='not_larger', layout='CHW', name="Resize"),
+        pre_post.LetterBox(target_shape=(img_size[0], img_size[1]), layout='CHW', name="LetterBox"),
+        pre_post.ImageBytesToFloat(),
+    ]
+
+    pipeline.add_pre_processing(pre_processing_steps)
+
+    # Define post-processing pipeline (RT-DETR specific)
+    post_processing_steps = [
+        # Confidence Filtering
+        pre_post.Step(
+            name="Greater",
+            op_type="Greater",
+            input_names=["scores", "confidence_threshold"],
+            output_names=["mask"],
+            attrs={"to_add": [
+                ("value", onnx.AttributeProto.AttributeType.FLOAT, args.confidence_threshold)
+            ]},
+        ),
+        pre_post.Step(
+            name="GatherElements_boxes",
+            op_type="Gather",
+            input_names=["boxes", "mask"],
+            output_names=["filtered_boxes"],
+            attrs={"to_add": [("axis", onnx.AttributeProto.AttributeType.INT, 1)]},
+        ),
+        pre_post.Step(
+            name="GatherElements_scores",
+            op_type="Gather",
+            input_names=["scores", "mask"],
+            output_names=["filtered_scores"],
+            attrs={"to_add": [("axis", onnx.AttributeProto.AttributeType.INT, 1)]},
+        ),
+        pre_post.Step(
+            name="GatherElements_classes",
+            op_type="Gather",
+            input_names=["classes", "mask"],
+            output_names=["filtered_classes"],
+            attrs={"to_add": [("axis", onnx.AttributeProto.AttributeType.INT, 1)]},
+        ),
+        # Scale boxes back to original image
+        (pre_post.ScaleNMSBoundingBoxes(layout='CHW'),
+            [
+                # A connection from original image to input 1
+                # A connection from the resized image to input 2
+                # A connection from the LetterBoxed image to input 3
+                # We use the three images to calculate the scale factor and offset.
+                # With scale and offset, we can scale the bounding box back to the original image.
+                pre_post.utils.IoMapEntry("BGRImageHWC", producer_idx=0, consumer_idx=1),
+                pre_post.utils.IoMapEntry("Resize", producer_idx=0, consumer_idx=2),
+                pre_post.utils.IoMapEntry("LetterBox", producer_idx=0, consumer_idx=3),
+        ]),
+    ]
+
+    pipeline.add_post_processing(post_processing_steps)
+
+    # Add the confidence_threshold input to the model
+    confidence_threshold_input = pre_post.create_named_value(
+        name="confidence_threshold",
+        data_type=TensorProto.FLOAT,
+        shape=[1],  # Scalar value
+    )
+    onnx_model.graph.input.extend([confidence_threshold_input])
+
+    # Run the pipeline and save the modified model
+    modified_model = pipeline.run(onnx_model)
+    onnx.save(modified_model, args.output)
+
+    print(f"ONNX model with pre/post-processing saved to {args.output}")
+
 
 def parse_args():
     """Parse command-line arguments."""
@@ -175,11 +259,12 @@ def parse_args():
     parser.add_argument('-w', '--weights', required=True, help='Input weights (.pth) file path (required)')
     parser.add_argument('-c', '--config', required=True, help='Input YAML (.yml) file path (required)')
     parser.add_argument('-s', '--size', nargs='+', type=int, default=[640], help='Inference size [H,W] (default [640])')
-    parser.add_argument('--opset', type=int, default=16, help='ONNX opset version')
+    parser.add_argument('--opset', type=int, default=18, help='ONNX opset version')
     parser.add_argument('--dynamic', action='store_true', help='Enable dynamic batch-size')
     parser.add_argument('--simplify', action='store_true', help='Simplify ONNX model')
     parser.add_argument('--batch', type=int, default=1, help='Batch size')
     parser.add_argument('--output', type=str, default='model.onnx', help='Output ONNX model file name')
+    parser.add_argument('--confidence_threshold', type=float, default=0.5, help='Confidence threshold')
     args = parser.parse_args()
     if not os.path.isfile(args.weights):
         raise SystemExit('Invalid weights file')
